@@ -1,0 +1,28 @@
+# Exemple : hbbs et hbbr construits par le Dockerfile de ce dépôt, sessions réservées au tailnet.
+# Example: hbbs and hbbr built from this repository's Dockerfile, sessions restricted to the tailnet.
+#
+#   docker build --network host -t rustdesk-server-tailnet:1.1.16 .
+#   docker compose -f compose.example.yaml up -d
+x-common: &common
+  image: rustdesk-server-tailnet:1.1.16
+  pull_policy: never
+  # Réseau de l'hôte : le serveur doit voir la vraie adresse de chaque client.
+  # Host network: the server must see each client's real address.
+  network_mode: host
+  restart: unless-stopped
+  environment:
+    # Plages de Tailscale. Vide ou absente : aucune restriction.
+    # Tailscale ranges. Empty or unset: no restriction.
+    INITIATOR_NETWORKS: "100.64.0.0/10,fd7a:115c:a1e0::/48"
+
+services:
+  hbbs:
+    <<: *common
+    command: ["hbbs", "-k", "_"]
+    volumes:
+      - ./data:/root
+  # La clé publique de data/id_ed25519.pub, en clair : hbbr n'a alors aucun accès à la clé privée.
+  # The public key from data/id_ed25519.pub, in clear: hbbr then has no access to the private key.
+  hbbr:
+    <<: *common
+    command: ["hbbr", "-k", "REMPLACER_PAR_LA_CLE_PUBLIQUE_REPLACE_WITH_PUBLIC_KEY"]

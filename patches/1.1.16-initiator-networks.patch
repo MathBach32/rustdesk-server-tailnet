@@ -1,0 +1,274 @@
+diff --git a/src/common.rs b/src/common.rs
+index 9c76f41..3028d74 100644
+--- a/src/common.rs
++++ b/src/common.rs
+@@ -8,9 +8,45 @@ use std::{
+     io::prelude::*,
+     io::Read,
+     net::SocketAddr,
++    sync::OnceLock,
+     time::{Instant, SystemTime},
+ };
+ 
++/// Réseaux autorisés à demander une session (connexion ou relais), lus une fois dans la variable
++/// d'environnement INITIATOR_NETWORKS : liste de réseaux CIDR séparés par des virgules, par
++/// exemple « 100.64.0.0/10,fd7a:115c:a1e0::/48 » pour un tailnet Tailscale. Variable absente ou
++/// vide : aucune restriction, comme le serveur d'origine. Une entrée illisible arrête le
++/// programme, pour qu'une faute de frappe ne laisse pas le serveur ouvert à tous sans le dire.
++pub fn initiator_networks() -> &'static [ipnetwork::IpNetwork] {
++    static RESEAUX: OnceLock<Vec<ipnetwork::IpNetwork>> = OnceLock::new();
++    RESEAUX.get_or_init(|| {
++        let valeur = std::env::var("INITIATOR_NETWORKS").unwrap_or_default();
++        let mut reseaux = Vec::new();
++        for entree in valeur.split(',').map(str::trim).filter(|x| !x.is_empty()) {
++            match entree.parse::<ipnetwork::IpNetwork>() {
++                Ok(reseau) => reseaux.push(reseau),
++                Err(err) => {
++                    // log n'est pas toujours prêt ici : println, comme gen_sk.
++                    println!("Fatal error: invalid INITIATOR_NETWORKS entry {entree:?}: {err}");
++                    std::process::exit(1);
++                }
++            }
++        }
++        reseaux
++    })
++}
++
++/// Vrai si l'adresse peut demander une session : réseau autorisé, ou aucune restriction.
++/// À appeler avec l'adresse TCP réelle, jamais avec celle d'un en-tête X-Real-IP.
++pub fn initiator_allowed(addr: SocketAddr) -> bool {
++    let reseaux = initiator_networks();
++    if reseaux.is_empty() {
++        return true;
++    }
++    let ip = hbb_common::try_into_v4(addr).ip();
++    reseaux.iter().any(|reseau| reseau.contains(ip))
++}
++
+ #[allow(dead_code)]
+ pub(crate) fn get_expired_time() -> Instant {
+     let now = Instant::now();
+diff --git a/src/relay_server.rs b/src/relay_server.rs
+index 0ec190a..3192b4e 100644
+--- a/src/relay_server.rs
++++ b/src/relay_server.rs
+@@ -31,7 +31,9 @@ use std::{
+ type Usage = (usize, usize, usize, usize);
+ 
+ lazy_static::lazy_static! {
+-    static ref PEERS: Mutex<HashMap<String, Box<dyn StreamTrait>>> = Default::default();
++    // Flux en attente de son pair, avec « venu d'un réseau autorisé » (INITIATOR_NETWORKS) :
++    // rangés ensemble, sous le même verrou, pour que l'appariement lise les deux d'un coup.
++    static ref PEERS: Mutex<HashMap<String, (Box<dyn StreamTrait>, bool)>> = Default::default();
+     static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
+     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
+     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
+@@ -48,6 +50,7 @@ const BLOCKLIST_FILE: &str = "blocklist.txt";
+ #[tokio::main(flavor = "multi_thread")]
+ pub async fn start(port: &str, key: &str) -> ResultType<()> {
+     let key = get_server_sk(key);
++    log::info!("initiator networks: {:?}", crate::common::initiator_networks());
+     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
+         let mut contents = String::new();
+         if file.read_to_string(&mut contents).is_ok() {
+@@ -383,10 +386,12 @@ async fn handle_connection(
+         log::info!("{} blocked", ip);
+         return;
+     }
++    // Adresse TCP réelle, avant tout en-tête X-Real-IP d'un WebSocket.
++    let autorise = crate::common::initiator_allowed(addr);
+     let key = key.to_owned();
+     let limiter = limiter.clone();
+     tokio::spawn(async move {
+-        allow_err!(make_pair(stream, addr, &key, limiter, ws).await);
++        allow_err!(make_pair(stream, addr, &key, limiter, ws, autorise).await);
+     });
+ }
+ 
+@@ -396,6 +401,7 @@ async fn make_pair(
+     key: &str,
+     limiter: Limiter,
+     ws: bool,
++    autorise: bool,
+ ) -> ResultType<()> {
+     if ws {
+         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+@@ -415,14 +421,20 @@ async fn make_pair(
+             Ok(response)
+         };
+         let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+-        make_pair_(ws_stream, addr, key, limiter).await;
++        make_pair_(ws_stream, addr, key, limiter, autorise).await;
+     } else {
+-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
++        make_pair_(FramedStream::from(stream, addr), addr, key, limiter, autorise).await;
+     }
+     Ok(())
+ }
+ 
+-async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter) {
++async fn make_pair_(
++    stream: impl StreamTrait,
++    addr: SocketAddr,
++    key: &str,
++    limiter: Limiter,
++    autorise: bool,
++) {
+     let mut stream = stream;
+     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
+         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
+@@ -432,7 +444,16 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
+                     return;
+                 }
+                 if !rf.uuid.is_empty() {
+-                    let mut peer = PEERS.lock().await.remove(&rf.uuid);
++                    let attente = PEERS.lock().await.remove(&rf.uuid);
++                    // Une session relayée doit avoir au moins un bout dans un réseau autorisé :
++                    // sinon les deux flux sont fermés (sortie de la fonction).
++                    if let Some((_, pair_autorise)) = &attente {
++                        if !autorise && !pair_autorise {
++                            log::warn!("Relay request {} from {} refused: neither side in initiator networks", rf.uuid, addr);
++                            return;
++                        }
++                    }
++                    let mut peer = attente.map(|(flux, _)| flux);
+                     if let Some(peer) = peer.as_mut() {
+                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
+                         let id = format!("{}:{}", addr.ip(), addr.port());
+@@ -451,7 +472,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
+                         USAGE.write().await.remove(&id);
+                     } else {
+                         log::info!("New relay request {} from {}", rf.uuid, addr);
+-                        PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
++                        PEERS.lock().await.insert(rf.uuid.clone(), (Box::new(stream), autorise));
+                         sleep(30.).await;
+                         PEERS.lock().await.remove(&rf.uuid);
+                     }
+diff --git a/src/rendezvous_server.rs b/src/rendezvous_server.rs
+index dff45eb..52b2a52 100644
+--- a/src/rendezvous_server.rs
++++ b/src/rendezvous_server.rs
+@@ -64,6 +64,9 @@ static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+ // Store punch hole requests
+ use once_cell::sync::Lazy;
+ use tokio::sync::Mutex as TokioMutex; // differentiate if needed
++/// Motif affiché par le client quand la demande vient d'hors des réseaux autorisés.
++const REFUS_RESEAU: &str = "Ce serveur n'accepte que les sessions demandées depuis le réseau de son administrateur";
++
+ #[derive(Clone)]
+ struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: String }
+ static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
+@@ -144,6 +147,7 @@ impl RendezvousServer {
+             }),
+         };
+         log::info!("mask: {:?}", rs.inner.mask);
++        log::info!("initiator networks: {:?}", crate::common::initiator_networks());
+         log::info!("local-ip: {:?}", rs.inner.local_ip);
+         std::env::set_var("PORT_FOR_API", port.to_string());
+         rs.parse_relay_servers(&get_arg("relay-servers"));
+@@ -479,6 +483,7 @@ impl RendezvousServer {
+         addr: SocketAddr,
+         key: &str,
+         ws: bool,
++        autorise: bool,
+     ) -> bool {
+         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
+             match msg_in.union {
+@@ -487,7 +492,7 @@ impl RendezvousServer {
+                     if let Some(sink) = sink.take() {
+                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                     }
+-                    allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
++                    allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws, autorise).await);
+                     return true;
+                 }
+                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
+@@ -495,6 +500,16 @@ impl RendezvousServer {
+                     if let Some(sink) = sink.take() {
+                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                     }
++                    if !autorise {
++                        log::warn!("Relay request from {} for peer {} refused: outside initiator networks", addr, rf.id);
++                        let mut msg_out = RendezvousMessage::new();
++                        msg_out.set_relay_response(RelayResponse {
++                            refuse_reason: REFUS_RESEAU.to_owned(),
++                            ..Default::default()
++                        });
++                        allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
++                        return true;
++                    }
+                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                         let mut msg_out = RendezvousMessage::new();
+                         rf.socket_addr = AddrMangle::encode(addr).into();
+@@ -677,6 +692,7 @@ impl RendezvousServer {
+         ph: PunchHoleRequest,
+         key: &str,
+         ws: bool,
++        autorise: bool,
+     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
+         let mut ph = ph;
+         if !key.is_empty() && ph.licence_key != key {
+@@ -688,6 +704,16 @@ impl RendezvousServer {
+             });
+             return Ok((msg_out, None));
+         }
++        // Après la clé : une mauvaise clé reste signalée comme telle, d'où qu'elle vienne.
++        if !autorise {
++            log::warn!("Punch hole request from {} for peer {} refused: outside initiator networks", addr, ph.id);
++            let mut msg_out = RendezvousMessage::new();
++            msg_out.set_punch_hole_response(PunchHoleResponse {
++                other_failure: REFUS_RESEAU.to_owned(),
++                ..Default::default()
++            });
++            return Ok((msg_out, None));
++        }
+         let id = ph.id;
+         // punch hole request from A, relay to B,
+         // check if in same intranet first,
+@@ -852,8 +878,9 @@ impl RendezvousServer {
+         ph: PunchHoleRequest,
+         key: &str,
+         ws: bool,
++        autorise: bool,
+     ) -> ResultType<()> {
+-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
++        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws, autorise).await?;
+         if let Some(addr) = to_addr {
+             self.tx.send(Data::Msg(msg.into(), addr))?;
+         } else {
+@@ -869,7 +896,8 @@ impl RendezvousServer {
+         ph: PunchHoleRequest,
+         key: &str,
+     ) -> ResultType<()> {
+-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
++        let autorise = crate::common::initiator_allowed(addr);
++        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false, autorise).await?;
+         self.tx.send(Data::Msg(
+             msg.into(),
+             match to_addr {
+@@ -1148,6 +1176,7 @@ impl RendezvousServer {
+         key: &str,
+         ws: bool,
+     ) -> ResultType<()> {
++        let autorise = crate::common::initiator_allowed(addr);
+         let mut sink;
+         if ws {
+             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+@@ -1171,7 +1200,7 @@ impl RendezvousServer {
+             sink = Some(Sink::Ws(a));
+             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
+                 if let tungstenite::Message::Binary(bytes) = msg {
+-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
++                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, autorise).await {
+                         break;
+                     }
+                 }
+@@ -1180,7 +1209,7 @@ impl RendezvousServer {
+             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+             sink = Some(Sink::TcpStream(a));
+             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
++                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, autorise).await {
+                     break;
+                 }
+             }
