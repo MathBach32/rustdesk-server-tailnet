@@ -63,7 +63,10 @@ en IPv4 et en IPv6 :
 - **depuis le tailnet** : bonne clé acceptée, et relais relié, des octets passant de l'un à
   l'autre ;
 - **en local**, relais avec un bout autorisé et un bout extérieur : relié, dans les deux ordres
-  d'arrivée.
+  d'arrivée ;
+- **avec de vrais clients** (RustDesk 1.5.3 sous Windows 10 et macOS 11, hors du tailnet), le 26/11/2026 :
+  - une session demandée depuis le tailnet s'ouvre, par le relais ;
+  - une session demandée par ce client est refusée, et il affiche le motif.
 
 ### Limites
 
@@ -133,7 +136,10 @@ over IPv4 and IPv6:
   - right key rejected with the reason, and relay request to hbbs rejected;
   - two relay requests with the same id cut when paired;
 - **from the tailnet**: right key accepted, and relay paired with bytes flowing;
-- **locally**, relay with one allowed and one outside end: paired, in both arrival orders.
+- **locally**, relay with one allowed and one outside end: paired, in both arrival orders;
+- **with real clients** (RustDesk 1.5.3 on Windows 10 and macOS 11, outside the tailnet), on 2026-11-26:
+  - a session requested from the tailnet opens, through the relay;
+  - a session requested by that client is refused, and it displays the reason.
 
 ### Limits
 
