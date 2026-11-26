@@ -4,8 +4,8 @@
 #
 #   docker build --network host -t rustdesk-server-tailnet:1.1.16 .
 #
-# Sources figées par commit : étiquette 1.1.16 et son sous-module hbb_common.
-FROM rust:1.90-alpine AS construction
+# Sources figées par commit (étiquette 1.1.16 et sous-module hbb_common), image Rust par empreinte.
+FROM rust:1.90-alpine@sha256:b4b54b176a74db7e5c68fdfe6029be39a02ccbcfe72b6e5a3e18e2c61b57ae26 AS construction
 RUN apk add --no-cache git musl-dev build-base perl pkgconf openssl-dev openssl-libs-static
 ENV OPENSSL_STATIC=1
 WORKDIR /src
